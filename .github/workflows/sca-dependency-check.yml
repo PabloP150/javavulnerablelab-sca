@@ -20,7 +20,7 @@ jobs:                                                       # Lista de trabajos 
   dependency-check:                                         # Identificador interno del job de análisis SCA
     name: Análisis SCA con Dependency-Check                 # Nombre visible del job en la ejecución
     runs-on: ubuntu-latest                                  # Máquina virtual Linux hospedada por GitHub
-    timeout-minutes: 60                                     # Corta el job si la descarga del NVD se queda colgada
+    timeout-minutes: 180                                    # Corta el job si se cuelga; la primera descarga del NVD supera una hora
     steps:                                                  # Pasos que se ejecutan en orden dentro del job
       # ---------------------------------------------------- Preparación del entorno (requisito 3)
       - name: Descargar el código                           # Paso 1: traer el repositorio al runner
@@ -48,7 +48,7 @@ jobs:                                                       # Lista de trabajos 
         run: mvn -B "org.owasp:dependency-check-maven:${DC_VERSION}:check" -Dformats=HTML,XML,JSON,SARIF -DnvdApiKey="$NVD_API_KEY" -DossindexAnalyzerEnabled=false -DfailBuildOnCVSS=7  # Genera los reportes en target/ y falla el job si hay CVSS >= 7
       # ---------------------------------------------------- Persistencia y publicación aunque el análisis falle
       - name: Guardar la base del NVD en la caché           # Paso 6: conservar la base para la próxima ejecución
-        if: always() && steps.cache-nvd.outputs.cache-hit != 'true'  # Corre aunque falle el análisis, salvo que la clave de hoy ya exista
+        if: ${{ !cancelled() && steps.cache-nvd.outputs.cache-hit != 'true' }}  # Corre aunque el análisis falle, pero no si se canceló y la base quedó a medias
         uses: actions/cache/save@v6                         # Acción oficial que sube la carpeta a la caché
         with:                                               # Parámetros que recibe la acción
           path: ~/.m2/repository/org/owasp/                 # La misma carpeta que se restauró en el paso 4
