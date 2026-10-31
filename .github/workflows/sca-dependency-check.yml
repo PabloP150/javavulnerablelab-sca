@@ -1,0 +1,90 @@
+# Pipeline SCA: analiza las dependencias de JavaVulnerableLab con OWASP Dependency-Check y publica los resultados en GitHub
+name: SCA con Dependency-Check                              # Nombre del workflow que se muestra en la pestaña Actions
+# ---------------------------------------------------------- Disparadores (requisito 1)
+on:                                                         # Eventos que inician el workflow
+  push:                                                     # 1) Cuando se hace push...
+    branches: [main]                                        #    ...a la rama main
+  pull_request:                                             # 2) Cuando se abre o actualiza un Pull Request...
+    branches: [main]                                        #    ...cuyo destino es main
+  workflow_dispatch:                                        # 3) Ejecución manual con el botón "Run workflow"
+# ---------------------------------------------------------- Permisos mínimos (requisito 2)
+permissions:                                                # Permisos del GITHUB_TOKEN; todo lo no listado queda en "none"
+  contents: read                                            # Solo lectura del código, suficiente para hacer checkout
+  security-events: write                                    # Escritura en Security > Code scanning para subir el SARIF
+# ---------------------------------------------------------- Versiones fijas de los plugins de Maven
+env:                                                        # Variables disponibles en todos los jobs
+  DC_VERSION: 13.0.0                                        # Versión de dependency-check-maven, igual a la del análisis local
+  CYCLONEDX_VERSION: 2.9.3                                  # Versión de cyclonedx-maven-plugin, igual a la del análisis local
+# ---------------------------------------------------------- Trabajos del pipeline
+jobs:                                                       # Lista de trabajos que corren en paralelo
+  dependency-check:                                         # Identificador interno del job de análisis SCA
+    name: Análisis SCA con Dependency-Check                 # Nombre visible del job en la ejecución
+    runs-on: ubuntu-latest                                  # Máquina virtual Linux hospedada por GitHub
+    timeout-minutes: 60                                     # Corta el job si la descarga del NVD se queda colgada
+    steps:                                                  # Pasos que se ejecutan en orden dentro del job
+      # ---------------------------------------------------- Preparación del entorno (requisito 3)
+      - name: Descargar el código                           # Paso 1: traer el repositorio al runner
+        uses: actions/checkout@v7                           # Acción oficial de GitHub que clona el repo
+      - name: Preparar Java 17                              # Paso 2: instalar el JDK que usan Maven y Dependency-Check
+        uses: actions/setup-java@v6                         # Acción oficial para instalar Java en el runner
+        with:                                               # Parámetros que recibe la acción
+          distribution: temurin                             # Distribución Eclipse Temurin (OpenJDK)
+          java-version: '17'                                # Versión mayor de Java pedida en el laboratorio
+      # ---------------------------------------------------- Caché de la base del NVD (requisito 5)
+      - name: Calcular la fecha para la clave de la caché   # Paso 3: una clave por día refresca la caché sin duplicarla
+        id: fecha                                           # Identificador para leer la salida de este paso
+        run: echo "hoy=$(date -u +%F)" >> "$GITHUB_OUTPUT"  # Publica la fecha UTC como salida del paso
+      - name: Restaurar la base del NVD                     # Paso 4: recuperar la base de la ejecución más reciente
+        id: cache-nvd                                       # Identificador para saber luego si hubo coincidencia exacta
+        uses: actions/cache/restore@v6                      # Solo restaura: guardar va aparte porque el análisis puede fallar
+        with:                                               # Parámetros que recibe la acción
+          path: ~/.m2/repository/org/owasp/                 # Carpeta donde el plugin de Maven guarda la base del NVD
+          key: nvd-${{ runner.os }}-${{ env.DC_VERSION }}-${{ steps.fecha.outputs.hoy }}  # Clave exacta del día
+          restore-keys: nvd-${{ runner.os }}-${{ env.DC_VERSION }}-  # Sin caché de hoy, usa la más reciente y solo baja lo nuevo
+      # ---------------------------------------------------- Análisis SCA (requisitos 4 y 6)
+      - name: Ejecutar Dependency-Check                     # Paso 5: analizar las dependencias del pom.xml
+        env:                                                # Variables disponibles solo en este paso
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}           # La clave sale del secreto del repositorio, nunca del YAML
+        run: mvn -B "org.owasp:dependency-check-maven:${DC_VERSION}:check" -Dformats=HTML,XML,JSON,SARIF -DnvdApiKey="$NVD_API_KEY" -DossindexAnalyzerEnabled=false -DfailBuildOnCVSS=7  # Genera los reportes en target/ y falla el job si hay CVSS >= 7
+      # ---------------------------------------------------- Persistencia y publicación aunque el análisis falle
+      - name: Guardar la base del NVD en la caché           # Paso 6: conservar la base para la próxima ejecución
+        if: always() && steps.cache-nvd.outputs.cache-hit != 'true'  # Corre aunque falle el análisis, salvo que la clave de hoy ya exista
+        uses: actions/cache/save@v6                         # Acción oficial que sube la carpeta a la caché
+        with:                                               # Parámetros que recibe la acción
+          path: ~/.m2/repository/org/owasp/                 # La misma carpeta que se restauró en el paso 4
+          key: nvd-${{ runner.os }}-${{ env.DC_VERSION }}-${{ steps.fecha.outputs.hoy }}  # La misma clave exacta del día
+      # ---------------------------------------------------- Publicar en Security > Code scanning (requisito 7)
+      - name: Subir SARIF a Code scanning                   # Paso 7: enviar los hallazgos a la pestaña Security
+        if: always() && hashFiles('target/dependency-check-report.sarif') != ''  # Subir aunque falle el análisis, si el reporte existe
+        uses: github/codeql-action/upload-sarif@v4          # Acción oficial de GitHub para cargar archivos SARIF
+        with:                                               # Parámetros que recibe la acción
+          sarif_file: target/dependency-check-report.sarif  # Reporte SARIF generado en el paso 5
+          category: dependency-check                        # Etiqueta que identifica este análisis en Code scanning
+      # ---------------------------------------------------- Guardar los reportes como artefactos (requisito 8)
+      - name: Guardar reportes como artefactos              # Paso 8: dejar los reportes descargables en la ejecución
+        if: always()                                        # Guardar siempre, aunque el análisis haya fallado
+        uses: actions/upload-artifact@v7                    # Acción oficial de GitHub para subir artefactos
+        with:                                               # Parámetros que recibe la acción
+          name: dependency-check-reports                    # Nombre del artefacto en el resumen de la ejecución
+          path: target/dependency-check-report.*            # Reportes HTML y XML, junto con el JSON y el SARIF
+          retention-days: 30                                # Días que GitHub conserva el artefacto antes de borrarlo
+  # ------------------------------------------------------------ Puntos extra: SBOM como artefacto
+  sbom:                                                     # Identificador interno del job del SBOM
+    name: Generar SBOM CycloneDX                            # Nombre visible del job en la ejecución
+    runs-on: ubuntu-latest                                  # Máquina virtual Linux hospedada por GitHub
+    steps:                                                  # Pasos que se ejecutan en orden dentro del job
+      - name: Descargar el código                           # Paso 1: traer el repositorio al runner
+        uses: actions/checkout@v7                           # Acción oficial de GitHub que clona el repo
+      - name: Preparar Java 17                              # Paso 2: instalar el JDK que usa Maven
+        uses: actions/setup-java@v6                         # Acción oficial para instalar Java en el runner
+        with:                                               # Parámetros que recibe la acción
+          distribution: temurin                             # Distribución Eclipse Temurin (OpenJDK)
+          java-version: '17'                                # Versión mayor de Java pedida en el laboratorio
+      - name: Generar el SBOM                               # Paso 3: inventariar las dependencias en formato CycloneDX
+        run: mvn -B "org.cyclonedx:cyclonedx-maven-plugin:${CYCLONEDX_VERSION}:makeAggregateBom" -DoutputFormat=json -DoutputName=bom  # Escribe target/bom.json
+      - name: Guardar el SBOM como artefacto                # Paso 4: dejar el SBOM descargable en la ejecución
+        uses: actions/upload-artifact@v7                    # Acción oficial de GitHub para subir artefactos
+        with:                                               # Parámetros que recibe la acción
+          name: sbom-cyclonedx                              # Nombre del artefacto en el resumen de la ejecución
+          path: target/bom.json                             # SBOM generado en el paso 3
+          retention-days: 30                                # Días que GitHub conserva el artefacto antes de borrarlo

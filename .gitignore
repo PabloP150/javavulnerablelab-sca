@@ -6,3 +6,12 @@ target/
 *.iml
 .vscode/
 .DS_Store
+
+# Reportes locales de SCA (Dependency-Check, SBOM)
+reportes/
+dependency-check-report*
+bom.json
+bom.xml
+
+# Entregables y credenciales locales del laboratorio
+entrega/
